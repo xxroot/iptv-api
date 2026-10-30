@@ -257,20 +257,27 @@ jobs:
 
 
           mapfile -d '' local_assets < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
-          gh release create "$RELEASE_TAG" "${local_assets[@]}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_SHA" \
-            --title "$release_title" \
-            --notes "$release_notes" \
-            --prerelease
-            for f in release-assets/*; do
-              for i in 1 2 3; do
-                  gh release upload "$RELEASE_TAG" "$f" \
-                        --repo "$GITHUB_REPOSITORY" --clobber && break
-                      echo "retry $((i+1)) for $f" >&2
-                      sleep 5
-                  done
-              done
+          # 删除 0 字节文件（空文件上传会报 400 Bad Content-Length）
+          find release-assets -maxdepth 1 -type f -size 0 -delete
+          
+          # 只创建 Release，不带附件
+          gh release create "$RELEASE_TAG" \
+          --repo "$GITHUB_REPOSITORY" \
+          --target "$SOURCE_SHA" \
+          --title "$release_title" \
+          --notes "$release_notes" \
+          --prerelease
+          
+          # 逐个上传附件，失败重试 3 次（你已经加好的这段，保持不变）
+          for f in release-assets/*; do
+          for i in 1 2 3; do
+              gh release upload "$RELEASE_TAG" "$f" \
+              --repo "$GITHUB_REPOSITORY" --clobber && break
+              echo "retry $((i+1)) for $f" >&2
+              sleep 5
+          done
+          done
+          
                   
 
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/local-assets.txt
