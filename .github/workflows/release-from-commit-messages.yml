@@ -2,18 +2,67 @@ name: Release from commit messages
 
 on:
   workflow_dispatch:
+  # 每天 18:00 UTC = 次日 02:00 北京时间，自动出一条 nightly 版本
   schedule:
     - cron: '0 18 * * *'
 
 permissions:
   contents: write
 
+# 防止定时与手动触发撞车抢同一个 tag
+concurrency:
+  group: nightly-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # 计算今天的版本号：<version.json 的 version>-nightly.<北京日期>
+  # 同一天已经发过就直接跳过，保证“每天只更一次”
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.meta.outputs.name }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      title: ${{ steps.meta.outputs.title }}
+      release: ${{ steps.meta.outputs.release }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Resolve nightly version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(python -c "import json,sys; d=json.load(open('version.json',encoding='utf-8')); n=(d.get('name') or '').strip(); sys.exit('version.json must contain name and version') if not n else print(n)")
+          base=$(python -c "import json,sys; d=json.load(open('version.json',encoding='utf-8')); v=(d.get('version') or '').strip(); sys.exit('version.json must contain name and version') if not v else print(v)")
+          date=$(TZ=Asia/Shanghai date +%Y%m%d)
+          version="${base}-nightly.${date}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${version}" >> "$GITHUB_OUTPUT"
+          echo "title=v${version}" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/${version}" > /dev/null; then
+            echo "Tag ${version} already exists, today's nightly is done."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "resolved name=${name} version=${version}"
+
   test:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
     uses: ./.github/workflows/tests.yml
 
   build:
-    needs: test
+    needs: [prepare, test]
+    if: needs.prepare.outputs.release == 'true'
+    env:
+      name: ${{ needs.prepare.outputs.name }}
+      version: ${{ needs.prepare.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,39 +75,20 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.14'
           update-environment: true
           cache: 'pipenv'
-
       - name: Install dependencies with pipenv
         shell: bash
         run: |
           python -m pip install --upgrade pip pipenv
           pipenv --python 3.14
           pipenv install --dev
-
       - name: Build the primary GUI application
         run: pipenv run ui_build
-
-      - name: Read version info
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json
-          import os
-
-          with open("version.json", encoding="utf-8") as file:
-              info = json.load(file)
-          if not info.get("name") or not info.get("version"):
-              raise SystemExit("version.json must contain name and version")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as file:
-              file.write(f"name={info['name']}\nversion={info['version']}\n")
-          PY
-
       - name: Package Windows application
         if: runner.os == 'Windows'
         shell: pwsh
@@ -71,7 +101,6 @@ jobs:
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
           $asset = "$env:name-GUI-Windows-$env:RUNNER_ARCH-v$env:version.zip"
           Compress-Archive -Path $bundle -DestinationPath (Join-Path $PWD "artifacts\$asset")
-
       - name: Package macOS application
         if: runner.os == 'macOS'
         shell: bash
@@ -84,7 +113,6 @@ jobs:
           mkdir -p artifacts
           asset="${name}-GUI-macOS-${RUNNER_ARCH}-v${version}.zip"
           ditto -c -k --sequesterRsrc --keepParent "$app_path" "artifacts/$asset"
-
       - name: Upload GUI artifact
         uses: actions/upload-artifact@v4
         with:
@@ -93,69 +121,44 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [prepare, build]
+    if: needs.prepare.outputs.release == 'true'
     runs-on: ubuntu-latest
+    env:
+      name: ${{ needs.prepare.outputs.name }}
+      version: ${{ needs.prepare.outputs.version }}
+      release_tag: ${{ needs.prepare.outputs.tag }}
+      release_title: ${{ needs.prepare.outputs.title }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           fetch-tags: true
-
       - name: Download GUI artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: gui-*
           path: release-assets
           merge-multiple: true
-
-      - name: Read version info
-        shell: pwsh
-        run: |
-          $json = Get-Content version.json -Raw | ConvertFrom-Json
-          if (-not $json.name -or -not $json.version) {
-            Write-Error 'version.json must contain name and version.'
-            exit 1
-          }
-          Add-Content -Path $env:GITHUB_ENV -Value "name=$($json.name)"
-          Add-Content -Path $env:GITHUB_ENV -Value "version=$($json.version)"
-          Add-Content -Path $env:GITHUB_ENV -Value "release_tag=$($json.version)"
-          Add-Content -Path $env:GITHUB_ENV -Value "release_title=v$($json.version)"
-
       - name: Validate release tag does not already exist
         shell: pwsh
         run: |
           $existingTag = git tag --list $env:release_tag
           if ($existingTag) {
-            Write-Error "Tag '$env:release_tag' already exists. Bump version.json before releasing."
+            Write-Error "Tag '$env:release_tag' already exists."
             exit 1
           }
-
       - name: Generate release notes from commit messages
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $versionCommits = @(git log --format=%H -- version.json)
-          $baseCommit = ''
-
-          if ($versionCommits.Count -ge 2) {
-            $baseCommit = $versionCommits[1].Trim()
-          } elseif ($versionCommits.Count -eq 1) {
-            $baseCommit = $versionCommits[0].Trim()
+          # nightly 以上一个 tag（通常是昨天的 nightly）为基准，只列当天新增的提交
+          $baseCommit = (git describe --tags --abbrev=0 2>$null)
+          if ($LASTEXITCODE -ne 0 -or -not $baseCommit) {
+            $baseCommit = (git rev-list --max-parents=0 HEAD | Select-Object -First 1)
           }
-
-          if (-not $baseCommit) {
-            try {
-              $baseCommit = (git describe --tags --abbrev=0).Trim()
-            } catch {
-              $baseCommit = ''
-            }
-          }
-
-          if (-not $baseCommit) {
-            $baseCommit = (git rev-list --max-parents=0 HEAD | Select-Object -First 1).Trim()
-          }
-
+          $baseCommit = $baseCommit.Trim()
           $rawMessages = git log --reverse --format=%s "$baseCommit..HEAD"
           $skipPatterns = @(
             '^(?i)release:\s*v?\d',
@@ -167,7 +170,6 @@ jobs:
             '^(?i)merge\s+pull\s+request\b',
             '^(?i)merge\b'
           )
-
           $notes = New-Object System.Collections.Generic.List[string]
           foreach ($line in $rawMessages) {
             $message = $line.Trim()
@@ -183,13 +185,11 @@ jobs:
               $notes.Add("- $message")
             }
           }
-
           if ($notes.Count -eq 0) {
-            $notes.Add("Release $env:release_title")
+            $notes.Add("Nightly build $env:release_title (no new commits since $baseCommit)")
           }
           $notes | Set-Content -Path release-notes.md -Encoding utf8
           Write-Host "Release notes generated from base commit: $baseCommit"
-
       - name: Publish GitHub release
         shell: pwsh
         env:
@@ -205,8 +205,9 @@ jobs:
             $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLower()
             "$hash  $(Split-Path $_ -Leaf)"
           } | Set-Content -Path $checksums -Encoding utf8NoBOM
-          gh release create $env:release_tag $assets $checksums --title $env:release_title --notes-file release-notes.md --target $env:GITHUB_SHA
-
+          $extra = @()
+          if ($env:version -match '-nightly\.') { $extra = @('--prerelease') }
+          gh release create $env:release_tag $assets $checksums --title $env:release_title --notes-file release-notes.md --target $env:GITHUB_SHA @extra
       - name: Confirm release
         shell: pwsh
-        run: Write-Host "Released version $env:version with Windows and macOS desktop assets."
+        run: Write-Host "Released $env:version with Windows and macOS desktop assets."
